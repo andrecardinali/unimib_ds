@@ -1,0 +1,1088 @@
+---
+title: "Bid Data in Economics project"
+output: pdf_document
+date: "2025-08-10"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(ggplot2)
+library(magrittr)
+library(dplyr)
+library(skimr)
+library(lubridate)
+library(tidyr)
+library(purrr)
+library(corrplot)
+library(gbm)
+library(stringr)
+library(purrr)
+library(cluster)
+library(data.table)
+library(igraph)
+library(MatchIt)
+library(caret)
+library(pROC)
+library(randomForest)
+library(e1071)
+library(janitor)
+library(hms)
+library(recipes)
+library(xgboost)
+```
+
+```{r}
+visite <- read.csv('in13.csv')
+abbonamenti <- read.csv('an13.csv', fileEncoding = "Windows-1252")
+clienti <- read.csv('data1.csv')
+```
+
+The file an13.csv containing the information about the subscriptions must be read with a different encoding. This is because some of the values of the column "riduzione" contain the symbol "€" and that is not parsed normally.
+
+```{r}
+visite$datai <- as.Date(visite$datai, format = "%d/%m/%Y")
+abbonamenti$data_inizio <- as.Date(abbonamenti$data_inizio, format = "%d/%m/%Y %H:%M")
+clienti$ultimo_ing.x <- as.Date(clienti$ultimo_ing.x, format = "%Y-%m-%d")
+clienti$abb13 <- as.Date(clienti$abb13, format = "%Y-%m-%d")
+clienti$abb14 <- as.Date(clienti$abb14, format = "%Y-%m-%d")
+visite$orai <- hm(visite$orai)
+abbonamenti$sesso <- as.factor(abbonamenti$sesso)
+
+colnames(visite)[colnames(visite) == 'CodCliente'] <- 'codcliente'
+
+clienti$si2014 <- as.factor(clienti$si2014)
+abbonamenti$data_nascita <- as.numeric(abbonamenti$data_nascita)
+#abbonamenti$cap <- as.numeric(abbonamenti$cap)
+```
+
+Some of the columns in the different datasets are in a date format, so they must be parsed accordingly as dates. The same applies to the sex and churn values, but they are treated as factors.
+
+```{r}
+skim_without_charts(visite)
+```
+
+From the visite dataset we can see that there are no missing values, there are 138 museums located in 9 provinces of Piemonte. The data are recorded from 01/12/2012 to 30/11/2013. The "importo" is the cost of the museum ticket that should have been paid if the client had no subscription.
+
+```{r}
+skim_without_charts(abbonamenti)
+```
+
+In this dataset there are variables about the type of subscription for each client: the discount applied, where they got the discount, in which municipality each client lives, their sex, date of birth, if they already had a subscription the year before and the total money paid for all the museum visits. This dataset contains some missing values, for example in the variable "sesso" and "data_nascita"; whereas the variable "professione" has only missing values.
+
+```{r}
+skim_without_charts(clienti)
+```
+
+This dataset contains information about the subscription for each client. The "ultimo_ing.x" variable is the recorded day of last visit, abb13 is the date in which people subscribed in 2013 and abb14 is when the subscription started in 2014. The variable abb14 has some missing values because not every client has kept their subscription, so for the churners the abb14 would have a missing value.
+
+```{r}
+df <- merge(clienti, abbonamenti, by = "codcliente", all.x = TRUE)
+```
+
+
+```{r}
+ggplot(clienti, aes(x = si2014)) +
+  geom_bar(fill = "lightblue") +
+  labs(title = "Churn vs Retained", x = "", y = "Count")
+```
+
+The variable si2014 identifies churners and non-churners, coded as 0 for churners and 1 for non-churners. We can see that churners are about 25.000, way less than the 55.000 non-churners.
+
+```{r}
+ggplot(df, aes(x = data_nascita, fill = si2014)) +
+  geom_histogram(binwidth = 1, position = "dodge", alpha = 0.8) +
+  labs(
+    title = "Year of Birth by Churn Status",
+    x = "Year of Birth",
+    y = "Count",
+    fill = "Status"
+  ) +
+  theme_minimal()
+```
+
+From this histogram we can see the age difference for churners and non-churners. Since there is no data about the age of clients, the year of birth was used instead. The majority of churners are older people, whereas the distribution of non-churners seems to be quite uniform without significant skeweness.
+There are some outliers probably caused by erroneous data entry, as there are people more than 100 years old - those born in 1900 - and some visitors that were born in 2050.
+
+```{r}
+sum(is.na(df$data_nascita))
+```
+
+
+```{r}
+top_museums <- visite %>%
+  count(museo) %>%
+  arrange(desc(n)) %>%
+  slice_head(n = 20) %>%
+  pull(museo)
+
+visite %>%
+  filter(museo %in% top_museums, !is.na(importo)) %>%
+  ggplot(aes(x = reorder(museo, importo, median), y = importo)) +
+  geom_boxplot(fill = "lightblue", alpha = 0.7) +
+  coord_flip() +
+  labs(
+    title = "Ticket Price Distribution – Top 20 Museums",
+    x = "Museum",
+    y = "Ticket Price (€)"
+  ) +
+  theme_minimal()
+
+```
+
+The boxplots can help visualise how much each museum ticket costs. These are the 20 most visited museum in Piemonte region, with "Palazzina di caccia di stupinigi" being the first. The first three museums are those with the highest price ticket of around 6€. The following have some outliers, meaning that some visitors are offered very high discount for the ticket.
+
+```{r}
+visits_per_customer <- visite %>%
+  group_by(codcliente) %>%
+  summarise(total_visits = n()) %>%
+  right_join(clienti %>% select(codcliente, si2014), by = "codcliente") %>%
+  mutate(total_visits = ifelse(is.na(total_visits), 0, total_visits),
+         churn_status = ifelse(si2014 == 0, "Churner", "Non-churner"))
+
+ggplot(visits_per_customer, aes(x = total_visits + 1, fill = churn_status)) +
+  geom_histogram(position = "identity", alpha = 0.6, bins = 30) +
+  scale_x_log10() +
+  scale_fill_manual(values = c("Churner" = "#E74C3C",
+                               "Non-churner" = "#2ECC71")) +
+  labs(title = "Total Visits per Customer in log scale",
+       x = "Total Visits +1",
+       y = "Count") +
+  theme_minimal()
+```
+
+```{r}
+ggplot(visits_per_customer, aes(x = si2014, y = total_visits + 1, fill = churn_status)) +
+  geom_boxplot(alpha = 0.6) +
+  scale_y_log10() +
+  labs(title = "Total Visits by Churn Status",
+       x = "Churn Status", y = "Total Visits (+1, log scale)") +
+  theme_minimal() +
+  scale_fill_manual(values = c("Churner" = "#E74C3C", "Non-churner" = "#2ECC71"))
+```
+
+When considering churners and non-churners, it's important to also check how many visits each customer did in total. The hist is in log scale so to get the number of total visits we have to subtract 1. It's clear that churners are those that made less visits to museums compared to non-churners, some didn't even visit a single museum - although even a big number of non-churners also didn't visit any - and as the number of visits increase, the number of churner diminishes. This is somewhat reasonable as we can expect people to not renew their subscription if it wasn't used much (or at all).
+
+```{r}
+abbonamenti %>%
+  filter(!is.na(data_inizio)) %>%
+  mutate(month_start = lubridate::month(data_inizio, label = TRUE, abbr = TRUE)) %>%
+  ggplot(aes(x = month_start)) +
+  geom_bar(fill = "steelblue", alpha = 0.8) +
+  labs(
+    title = "Distribution of Card Start Dates by Month",
+    x = "Month",
+    y = "Number of New Cards"
+  ) +
+  theme_minimal()
+
+```
+
+It's interesting to see the distribution of new membership card activation. Here we can see that the majority of subscriptions are activated in the month of December, followed by January.
+
+```{r}
+abbonamenti %>%
+  filter(!is.na(data_inizio), month(data_inizio) == 12) %>%
+  mutate(day_start = lubridate::day(data_inizio)) %>%
+  ggplot(aes(x = day_start)) +
+  geom_bar(fill = "darkred", alpha = 0.8) +
+  labs(
+    title = "Distribution of Card Start Dates – December",
+    x = "Day of Month",
+    y = "Number of New Cards"
+  ) +
+  scale_x_continuous(breaks = 1:31) +
+  theme_minimal()
+```
+
+However, Christmas is not the reason for the high number of new subscriptions as most of them are being activated between the 9th and the 21st of December.
+
+```{r}
+visite <- visite %>%
+  mutate(weekday = lubridate::wday(datai, label = TRUE, abbr = TRUE),
+         month   = lubridate::month(datai, label = TRUE, abbr = TRUE))
+
+visits_heatmap <- visite %>%
+  group_by(month, weekday) %>%
+  summarise(visits = n(), .groups = 'drop')
+
+ggplot(visits_heatmap, aes(x = month, y = weekday, fill = visits)) +
+  geom_tile(color = "white") +
+  scale_fill_gradient(low = "lightblue", high = "darkblue") +
+  labs(title = "Visits by Day of Week and Month",
+       x = "Month", y = "Day of Week") +
+  theme_minimal()
+```
+
+When talking about the visits, it can be nice to see the day of the week visits are mostly taking place, and without surprise people are visiting museums mainly during weekends in spring and in autumn, from March to June and from September to November.
+
+```{r}
+top_museums <- visite %>%
+  count(museo, sort = TRUE) %>%
+  pull(museo)
+
+df_top <- visite %>%
+  filter(museo %in% head(top_museums, 20)) %>%
+  distinct(codcliente, museo)
+
+pairs <- df_top %>%
+  group_by(codcliente) %>%
+  summarise(musei = list(sort(museo)), .groups = "drop") %>%
+  mutate(pairs = map(musei, ~ {
+    m <- .x
+    if (length(m) < 2) return(NULL)
+    as.data.frame(t(combn(m, 2)), stringsAsFactors = FALSE)
+  })) %>%
+  select(pairs) %>%
+  unnest(pairs) %>%
+  rename(museo_a = V1, museo_b = V2)
+
+cooc <- pairs %>%
+  count(museo_a, museo_b, name = "n")
+
+ggplot(cooc, aes(museo_a, museo_b, fill = n)) +
+  geom_tile(color = "white") +
+  scale_fill_gradient(low = "white", high = "red") +
+  labs(title = "Museum Co-occurrence (unique per customer)",
+       x = "Museum", y = "Museum", fill = "Co-visits") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 8),
+        axis.text.y = element_text(size = 8))
+```
+
+Another plot to check is the co-occurrence matrix of 20 most visited museums by subscribers. The darker the colour the higher the co-occurrence, meaning that people often visit two museums in the same day. For example, "Reggia di Venaria reale" and "GAM", or "Reggia di Venaria reale" and "Museo civico d'arte antica ..." are often visited together by clients.
+
+```{r}
+abbo_small <- abbonamenti %>%
+  select(codcliente, riduzione) %>%
+  rename(discount_type = riduzione)
+
+# Merge visits with discount info
+visits_with_discount <- visite %>%
+  inner_join(abbo_small, by = "codcliente")
+
+top_museums <- visits_with_discount %>%
+  count(museo, sort = TRUE) %>%
+  pull(museo)
+
+# Filter and count co-occurrence
+discount_museum_counts <- visits_with_discount %>%
+  filter(museo %in% head(top_museums, 30)) %>%
+  count(discount_type, museo)
+
+ggplot(discount_museum_counts, aes(x = discount_type, y = museo, fill = n)) +
+  geom_tile(color = "white") +
+  scale_fill_gradient(low = "white", high = "darkred") +
+  labs(title = "Co-occurrence of Discount Type and Museum Visits",
+       x = "Discount Type", y = "Museum", fill = "Number of Visits") +
+  theme_minimal(base_size = 13) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 9),
+        axis.text.y = element_text(size = 5))
+```
+
+The co-occurence can also be observed between the museums and the type of discount used to get the ticket. The most used discounts are the basic "Abbonamenti musei Torino" and "Abbonamento musei ridotto", which are mainly used to visit the "Reggia di venaria reale", "Museo civ. d'arte antica", "GAM" and so forth.
+
+### 2
+
+The variable regarding the year of birth of the visitors seem to have some outliers. The older visitor was born in 1900, meaning that in 2012/2013 they would be 112/113 years old, which is very unlikely. There is also another problem with the maximum value of the variable, which is 2076 and that would be impossible as the data refers to the 2012/2013 years.
+
+```{r}
+visite %>%
+  group_by(codcliente) %>%
+  summarise(total_visits = n()) %>%
+  arrange(desc(total_visits))
+```
+
+```{r}
+visite %>%
+  filter(codcliente == 219314) %>%
+  group_by(datai, museo) %>%
+  summarise(visits = n(), .groups = "drop") %>%
+  arrange(datai, desc(visits)) %>%
+  filter(visits > 1)
+```
+
+
+```{r}
+visite %>%
+  group_by(codcliente, datai, orai, museo) %>%
+  summarise(dup_count = n(), .groups = "keep") %>%
+  filter(dup_count > 1)
+```
+
+It appears that there are many duplicate in the visits, as some visitors are counted twice for the same museum at the same time. There are also some people that have visited museums more than 100 times, with the maximum being visitor 219314 that made 264 visits. When checking the museum visited by person 219314, we see that he/she visited the same museum multiple times in a day: for example, "REGGIA DI VENARIA REALE"  was visited 4 times in a day.
+
+### 3
+
+The variable with most missing values is the variable abb14, which is the date of the subscription renewal in 2014. Since there is no date to register for churner customers, the missing data are to be expected. However, there are about 15 more missing values in "abb14" than in si2014.
+Other variables have some missing values, like data_nascita, ultimo_ing.x and sesso. The only variable that is not worth keeping is the "professione", which has only missing values, thus it doesn't provide any worthy information.
+
+### 4
+
+To cluster data, it was chosen to also count the total visits made and the sum of the cost of tickets bought for each customer. The result is then merged with the dataset of clients.
+
+```{r}
+visits_summary <- visite %>%
+  group_by(codcliente) %>%
+  summarise(
+    total_visits = n(),
+    unique_museums = n_distinct(museo))
+
+price_info <- abbonamenti %>%
+  group_by(codcliente) %>%
+  summarise(
+    mean_importo = mean(importo, na.rm = TRUE))
+
+cluster_data <- clienti %>%
+  select(codcliente, si2014) %>%
+  left_join(visits_summary, by = "codcliente") %>%
+  left_join(price_info, by = "codcliente")
+
+cluster_data <- na.omit(cluster_data)
+X <- cluster_data %>% select(-codcliente, -si2014)
+X <- X %>% mutate(across(where(is.character), ~ as.numeric(factor(.x))))
+X <- X %>% mutate(across(where(is.factor), ~ as.numeric(.x)))
+X <- X %>% mutate(across(everything(), ~ replace(., is.infinite(.), NA_real_)))
+X <- X %>% select(where(~ !all(is.na(.))))
+
+is_zero_var <- sapply(X, function(v) {
+  s <- sd(v, na.rm = TRUE)
+  is.na(s) || s == 0
+})
+
+X <- X[, !is_zero_var, drop = FALSE]
+X <- X %>% mutate(across(everything(), ~ ifelse(is.na(.), median(., na.rm = TRUE), .)))
+
+X_mat <- as.matrix(X)
+X_scaled <- scale(X_mat)
+keep    <- complete.cases(X_scaled)
+X_scaled <- X_scaled[keep, ]
+ids      <- cluster_data$codcliente[keep]
+y        <- cluster_data$si2014[keep]
+
+set.seed(123)
+km <- kmeans(X, centers = 3, nstart = 50)
+table(km$cluster, y)
+prop.table(table(km$cluster, y), 1)
+```
+
+```{r}
+km["centers"]
+```
+
+```{r}
+ks <- 2:10
+set.seed(123)
+
+idx <- sample(seq_len(nrow(X)), size = min(5000, nrow(X)))
+sil <- sapply(ks, function(k) {
+  cl <- kmeans(X[idx, , drop=FALSE], centers = k, nstart = 20)$cluster
+  mean(cluster::silhouette(cl, dist(X[idx, , drop=FALSE]))[, "sil_width"])
+})
+plot(ks, sil, type = "b", xlab = "k", ylab = "Avg silhouette (sample)")
+```
+
+
+
+```{r}
+set.seed(123)
+km <- kmeans(X, centers = 4, nstart = 50)
+
+table(km$cluster, y)
+prop.table(table(km$cluster, y), 1)
+```
+
+```{r}
+km['centers']
+```
+
+By using the k-means algorithm, it's possible to cluster the observations considering the variables of total visits, unique museums visited, average price paid and churn. The ideal number of cluster was found after computing the silhouette value and 4 is the number of cluster with the highest score.
+
+Cluster 4 has the highest rate of churners (0.49) while cluster 1 and 3 have the highest number of churners (8650 and 9106 respectively), people in this cluster only visited museums 5 times and "spent" 8€ on average. We can see that the second cluster has the fewer churners than any other cluster and is made up of people that visited most museums (almost 22 visits on average in 13 museums) and "spent" 37€ on average.
+
+We can think that churning is linked more to the number of visits rather than the price paid for each museum ticket.
+
+### 5
+
+```{r}
+setDT(visite)
+
+vis_ev <- unique(visite[, .(codcliente, museo, datai, orai)])
+vis_ev <- vis_ev[!is.na(datai) & !is.na(orai) & nzchar(orai)]
+vis_ev[, event_id := .GRP, by = .(museo, datai, orai)]
+
+edges <- vis_ev[vis_ev, on = "event_id", allow.cartesian = TRUE][
+  codcliente < i.codcliente,
+  .N, by = .(from = codcliente, to = i.codcliente)]
+edges <- edges[N >= 3][, weight := N][, N := NULL]
+
+g <- graph_from_data_frame(edges, directed = FALSE)
+
+deg  <- degree(g)
+strg <- strength(g, weights = E(g)$weight)
+wInv <- 1 / E(g)$weight
+btw  <- betweenness(g, directed = FALSE, weights = wInv, normalized = TRUE)
+cls  <- closeness(g,  weights = wInv, normalized = TRUE)
+eig  <- eigen_centrality(g, weights = E(g)$weight)$vector
+pr   <- page_rank(g, weights = E(g)$weight)$vector
+
+centrality <- data.table(
+  codcliente = names(deg),
+  degree = as.numeric(deg),
+  strength = as.numeric(strg),
+  betweenness = as.numeric(btw),
+  closeness = as.numeric(cls),
+  eigenvector = as.numeric(eig),
+  pagerank = as.numeric(pr))[order(-pagerank)]
+
+comp <- components(g)
+g_giant <- induced_subgraph(g, which(comp$membership == which.max(comp$csize)))
+plot(g_giant,
+     vertex.size = 4,
+     vertex.label = NA,
+     edge.width = E(g_giant)$weight,
+     layout = layout_with_fr(g_giant))
+```
+
+To connect the people that visited the same museum at the same time it was necessary to consider the unique visits for each customer, as there are many duplicates in the dataset. For each event, an event_id is assigned to the group of visits, then visitors are matched by the codcliente. The co-occurence of visits are considered only if they are more than 2 for each group of visitors. The function creates a graph that represents visitors as nodes and "co-visitation" as edges and weighting all by the number of co-visits. Centrality measures are then computer for the graph, like degree, strength and pagerank.
+
+```{r}
+g1 <- induced_subgraph(g, which(comp$membership == which.max(comp$csize)))
+
+V(g1)$si2014   <- clienti$si2014[match(V(g1)$name, clienti$codcliente)]
+V(g1)$pagerank <- pr[V(g1)$name]
+
+plot(
+  g1,
+  vertex.size  = scales::rescale(V(g1)$pagerank, to = c(2, 10)),
+  vertex.color = ifelse(V(g1)$si2014 == 0, "#e15759", "#4e79a7"),
+  vertex.label = NA,
+  edge.width   = scales::rescale(E(g1)$weight, to = c(0.5, 4)),
+  layout       = layout_with_fr(g1),
+  main         = "Customers’ co-visit network (edge: ≥3 co-visits same museum & time)"
+)
+```
+
+The graph is plotted also with nodes colored differently, whether they're churners or not, and the edges are weighted according to the pagerank value of the nodes. The pagerank values the quality of connections where well connected nodes, that's many connections with high weights, have higher values.
+
+```{r}
+sum(centrality$pagerank)
+summary(E(g)$weight)
+vcount(g); length(unique(c(edges$from, edges$to)))
+
+sum(centrality$pagerank)
+min(centrality$pagerank)
+```
+There is a need to check the values of centrality, such as the weights of the edges which all of them must be equal or greater than 3. Then the number of nodes in the graph equals the number of visitors that are in at least one qualifying pair. Lastly, pagerank measures the importance of each customer in the customer-museum network; the higher the value the more important it is. The sum of all the pagerank values should be equal to 1, as in this case.
+
+### 6
+
+```{r}
+df <- merge(df, visits_per_customer, by = "codcliente")
+typeof(df$sesso)
+```
+
+```{r}
+df_clean <- df %>% 
+            filter(!is.na(sesso), !is.na(data_nascita))
+```
+
+```{r}
+match_model <- matchit(sesso ~ importo + riduzione + sconto + total_visits +
+                       agenzia_tipo + data_nascita,
+                       data = df_clean,
+                       method = "nearest", distance = "logit")
+summary(match_model)
+```
+
+```{r}
+plot(match_model, type = "jitter", interactive = FALSE)
+```
+
+```{r}
+plot(match_model, type = 'hist', which = "prop.score")
+```
+
+```{r}
+plot(match_model, type = "qq", interactive = FALSE,
+     which.xs = c("importo", "data_nascita", "total_visits"))
+```
+
+```{r}
+matched_data <- match.data(match_model)
+model <- glm(si2014.y ~ sesso, data = matched_data, family = binomial)
+summary(model)
+```
+
+```{r}
+exp(coef(model)["sessoM"])
+```
+
+To check if the sex has an impact on churning, we have to consider the possible impact of the other variables on churning, so it's necessary to build a counter factual group from the observed data.
+The propensity score matching is estimated with a logistic regression with some covariates -  importo, riduzione, sconto, total_visits, agenzia_tipo and data_nascita - that may influence more the churning. Matching is done with the nearest neighbour that matches a male with a female with the closer score.
+
+After matching the units, a generalised linear model is applied on that data to check if sex is statistically significant. The intercept (0.907) is the log-odds of not churning for the reference group of females. The estimate of -0.104 for males means that they have a lower log-odds of renewing that females. Since the p-value of the estimate is statistically significant, we can asses that sex actually has an effect on churning in the common support region.
+
+### 7
+
+```{r}
+df_clean <- merge(df_clean, centrality, by = "codcliente")
+set.seed(123)
+
+```
+
+
+```{r}
+perc_train_set <- 0.7
+index <- createDataPartition(df_clean$si2014.x, p = perc_train_set, list = FALSE)
+train <- df_clean[index,]
+test <- df_clean[-index,]
+```
+
+```{r}
+table(df_clean$si2014.x)/dim(df_clean)[1]
+```
+
+```{r}
+table(train$si2014.x)/dim(train)[1]
+```
+
+The target distribution of churners is kept over the training set, so it's ok to proceed.
+Let's begin with a logistic model considering the covariates of total_visists, importo, sesso, sconto, data nascita, nuovo abb, degree, streength, closeness and pagerank from the centrality measures.
+
+```{r}
+logit_model <- glm(si2014.x ~ total_visits + importo + sesso + sconto + 
+                   data_nascita + nuovo_abb + degree + strength + closeness + pagerank,
+                   data = train, family = binomial)
+
+logit_probs <- predict(logit_model, newdata = test, type = "response")
+
+p_churn <- logit_probs
+
+pred_logit <- ROCR::prediction(predictions = p_churn, labels = test$si2014.x)
+perf_roc   <- ROCR::performance(pred_logit, measure = "tpr", x.measure = "fpr", positive = "0")
+perf_auc   <- ROCR::performance(pred_logit, measure = "auc", positive = "0")
+auc_val    <- perf_auc@y.values[[1]]
+
+ROC_df_logit <- data.frame(fpr = perf_roc@x.values[[1]],
+                           tpr = perf_roc@y.values[[1]])
+colnames(ROC_df_logit) <- c("fpr","tpr")
+
+ggplot(ROC_df_logit, aes(x = fpr, y = tpr)) +
+  geom_path(color = "blue", linewidth = 1) +
+  geom_abline(linetype = "dashed") +
+  coord_equal(xlim = c(0,1), ylim = c(0,1), expand = FALSE) +
+  labs(title = sprintf("ROC (Logit) — AUC = %.3f", auc_val),
+       x = "FPR", y = "TPR") +
+  theme_minimal()
+```
+
+The result of this model shows that the AUC is 0.752, which is a quite good result. However, we would like to find a model that achieves even better results, so to identify most of the churners.
+
+```{r}
+plot <- data.frame(logit_probs, test$si2014.x)
+ggplot(data=plot, aes(x=logit_probs, 
+                      group=test.si2014.x,
+                      fill=test.si2014.x)) +
+  geom_density(adjust=1.5, alpha=.4)
+```
+
+The density plot the distribution of the model's predicted probabilities by class. The non-churn class (1) is highly concentrated around 0.8 and 1, while the churn class (0) lies around 0.5 and 0.75. This defines a quite good separation as the model assigns higher scores to non-churners and lower scores to churners. In the overlapping zone - that's around 0.55 and 0.8 - the curves will generate most false positives and negatives, while outside the model is highly confident, with low errors.
+
+The second model applied is a random forest, with the same covariates as the logistic model. 
+
+```{r}
+rf_model <- randomForest(as.factor(si2014.x) ~ total_visits + importo + sesso + sconto + 
+                         data_nascita + nuovo_abb + degree + strength + closeness + pagerank,
+                         data = train, ntree = 500)
+
+prediction_prob_rf <- predict(rf_model, test, type = 'prob')[,2]
+roc_rf <- ROCR::prediction(predictions = prediction_prob_rf, labels = test$si2014.x)
+perf.roc_rf <- ROCR::performance(roc_rf, measure = "tpr", x.measure = "fpr")
+perf.auc_rf <- ROCR::performance(roc_rf, measure = "auc")
+auc_val    <- perf.auc_rf@y.values[[1]]
+ROC_df_rf <- data.frame(unlist(perf.roc_rf@x.values),
+                        unlist(perf.roc_rf@y.values))
+colnames(ROC_df_rf) <- c("fpr","tpr")
+
+#print(paste("AUC (RandomForest) -->",format((perf.auc_rf@y.values)[[1]]*100,digits = 4), "%"))
+
+xline <- seq(0,1,0.02)
+yline <- seq(0,1,0.02)
+xyline <- data.frame(xline,yline)
+
+ggplot() + 
+  #geom_line(data=ROC_df_cart, aes(x=fpr, y=tpr, color="CART")) +
+  geom_line(data=ROC_df_rf, aes(x=fpr, y=tpr, color="RF")) +
+  geom_line(data=xyline, aes(x=xline, y=yline), color='black', linetype = "dashed") +
+  labs(title = sprintf("ROC (RF) — AUC = %.3f", auc_val), x = "FPR", y = "TPR")
+  ggtitle("ROC")
+```
+
+The value of 0.72 of the AUC shows that the model is able to identify a good number of churners but it does so slightly worse than the logistic model.
+
+```{r}
+plot <- data.frame(prediction_prob_rf, test$si2014.x)
+ggplot(data=plot, aes(x=prediction_prob_rf,
+                      group=test.si2014.x,
+                      fill=test.si2014.x)) +
+  geom_density(adjust=1.5, alpha=.4)
+```
+
+The same thing applies also for the density distribution of the probabilities. The non-churners are highly concentrated on the right side, around 0.75 and 1, while churners are around 0.5 and 0.7. The separation here is less clear than the logistic model, so there could be a higher number of false negative and positive.
+
+Now let's try the support vector machine model. This model includes only few covariates since the computational power is limited and it can't compute the complete model. Another limitation was the dimension of the data to process: the model was applied to a sample of data but keeping in mind the ratio of churners and non churners, so to have a representative sample.
+
+```{r}
+train$sesso <- factor(train$sesso)
+test$sesso <- factor(test$sesso, levels=levels(train$sesso))
+
+set.seed(1234)
+target_n <- 10000
+props <- prop.table(table(train$si2014.x))
+n_per  <- round(as.numeric(props) * target_n)
+names(n_per) <- names(props)
+
+n_each <- min(2000L, min(table(train$si2014.x)))
+
+train_samp <- train %>%
+  group_by(si2014.x) %>%
+  slice_sample(n = n_each) %>%
+  ungroup()
+
+test_samp <- test %>%
+  group_by(si2014.x) %>%
+  slice_sample(n = n_each) %>%
+  ungroup()
+
+tr <- data.frame(
+  y = factor(train_samp$si2014.x, levels=c("0","1")),
+  total_visits = train_samp$total_visits,
+  importo = train_samp$importo,
+  sesso = train_samp$sesso
+  #degree = train_samp$degree,
+  #strength = train_samp$strength,
+  #betweenness = train_samp$betweenness,
+  #closeness = train_samp$closeness,
+  #pagerank = train_samp$pagerank
+)
+
+te <- data.frame(
+  total_visits = test_samp$total_visits,
+  importo = test_samp$importo,
+  sesso = test_samp$sesso
+  #degree = train_samp$degree,
+  #strength = train_samp$strength,
+  #betweenness = train_samp$betweenness,
+  #closeness = train_samp$closeness,
+  #pagerank = train_samp$pagerank
+)
+
+y_true <- factor(test_samp$si2014.x, levels=c("0","1"))
+
+tab <- table(tr$y)
+cw <- as.list((sum(tab)/length(tab)) / (tab/sum(tab)))
+names(cw) <- levels(tr$y)
+
+svm_mod <- svm(y ~ ., data = tr, kernel = "radial",
+               probability = TRUE, cost = 1, gamma = 0.1,
+               class.weights = cw)
+
+svm_pred <- predict(svm_mod, te, probability = TRUE)
+p_churn  <- attr(svm_pred, "probabilities")[, "1"]
+
+pred <- ROCR::prediction(p_churn, y_true)
+auc  <- ROCR::performance(pred, "auc", positive="0")@y.values[[1]]
+perf <- ROCR::performance(pred, "tpr", "fpr", positive="0")
+df   <- data.frame(fpr = perf@x.values[[1]], tpr = perf@y.values[[1]])
+
+ggplot(df, aes(fpr, tpr)) +
+  geom_path(color = "steelblue", linewidth = 1) +
+  geom_abline(linetype = "dashed") +
+  coord_equal(xlim=c(0,1), ylim=c(0,1), expand=FALSE) +
+  labs(title = sprintf("SVM (RBF) ROC — AUC = %.3f", auc),
+       x = "FPR", y = "TPR") +
+  theme_minimal()
+```
+
+This model performs worse than then previous two, with the AUC reaching only 0.679, which is not acceptable when compared to other results.
+
+```{r}
+plot <- data.frame(p_churn, test_samp$si2014.x)
+ggplot(data=plot, aes(x=p_churn,
+                      group=test_samp.si2014.x,
+                      fill=test_samp.si2014.x)) +
+                      xlab("P(non-churn)") + ylab("Density") +
+                      geom_density(adjust=1.5, alpha=.4)
+```
+
+The density distribution shows a clear separation between churners and non-churners, with the former being at around 0.3 and the latter at around 0.6.
+
+The SVM can also be applied with a different kernel function. We can try a SVM with a polynomial function as kernel, instead of a radial function used earlier.
+
+```{r}
+svm_mod <- svm(y ~ ., data = tr, kernel = "polynomial", , degree = 3, coef0 = 1,
+               probability = TRUE, cost = 1, gamma = 0.1,
+               class.weights = cw)
+
+svm_pred <- predict(svm_mod, te, probability = TRUE)
+p_churn  <- attr(svm_pred, "probabilities")[, "1"]
+
+pred <- ROCR::prediction(p_churn, y_true)
+auc  <- ROCR::performance(pred, "auc", positive="0")@y.values[[1]]
+perf <- ROCR::performance(pred, "tpr", "fpr", positive="0")
+df   <- data.frame(fpr = perf@x.values[[1]], tpr = perf@y.values[[1]])
+
+ggplot(df, aes(fpr, tpr)) +
+  geom_path(color = "steelblue", linewidth = 1) +
+  geom_abline(linetype = "dashed") +
+  coord_equal(xlim=c(0,1), ylim=c(0,1), expand=FALSE) +
+  labs(title = sprintf("SVM (RBF) ROC — AUC = %.3f", auc),
+       x = "FPR", y = "TPR") +
+  theme_minimal()
+```
+
+Changing the kernel function does not solve things, on the contrary the result gets worse, with a AUC of 0.662.
+
+```{r}
+plot <- data.frame(p_churn, test_samp$si2014.x)
+ggplot(data=plot, aes(x=p_churn,
+                      group=test_samp.si2014.x,
+                      fill=test_samp.si2014.x)) +
+                      xlab("P(non-churn)") + ylab("Density") +
+                      geom_density(adjust=1.5, alpha=.4)
+```
+
+The distribution does not show a clear separation like the previous one. There is a big overlap between 0.4 and 0.6.
+
+Another model that is possible to use is the XGBoost. In this model almost all covariates are included, however it's still necessary to choose a sample for technology constraints.
+
+```{r}
+set.seed(123)
+
+df_clean_red <- df_clean[, c("si2014.x", "ultimo_ing.x", "data_inizio", "importo", "sconto",
+                         "riduzione", "tipo_pag", "agenzia", "agenzia_tipo", "sesso", "data_nascita",
+                         "comune", "cap", "nuovo_abb", "total_visits", "degree", "strength", "betweenness",
+                         "closeness", "eigenvector", "pagerank")]
+
+n_train <- min(4000L, min(table(df_clean_red$si2014.x)))
+n_test <- min(2000L, min(table(df_clean_red$si2014.x)))
+
+y <- df_clean_red$si2014.x
+idx <- createDataPartition(y, p = 0.7, list = FALSE)
+train <- df_clean_red[idx, ]
+test  <- df_clean_red[-idx, ]
+
+train <- train %>%
+  group_by(si2014.x) %>%
+  slice_sample(n = n_train) %>%
+  ungroup()
+
+test <- test %>%
+  group_by(si2014.x) %>%
+  slice_sample(n = n_test) %>%
+  ungroup()
+
+y_tr <- as.numeric(as.character(train$si2014.x))
+y_te <- as.numeric(as.character(test$si2014.x))
+
+Xtr_raw <- subset(train, select = -si2014.x)
+Xte_raw <- subset(test,  select = -si2014.x)
+
+dmy <- dummyVars(~ ., data = Xtr_raw, fullRank = TRUE)
+Xtr <- as.data.frame(predict(dmy, newdata = Xtr_raw))
+Xte <- as.data.frame(predict(dmy, newdata = Xte_raw))
+
+common <- intersect(names(Xtr), names(Xte))
+Xtr <- Xtr[, common, drop = FALSE]
+Xte <- Xte[, common, drop = FALSE]
+
+# Optional: simple NA impute (xgboost can handle NA, but this keeps other steps happy)
+# If you prefer letting xgboost handle NA, comment the next 4 lines.
+#for (j in seq_along(Xtr)) {
+#  if (anyNA(Xtr[[j]])) Xtr[[j]][is.na(Xtr[[j]])] <- median(Xtr[[j]], na.rm = TRUE)
+#  if (anyNA(Xte[[j]])) Xte[[j]][is.na(Xte[[j]])] <- median(Xtr[[j]], na.rm = TRUE)}
+
+Xtr_m <- as.matrix(Xtr)
+Xte_m <- as.matrix(Xte)
+
+dtrain <- xgb.DMatrix(data = Xtr_m, label = y_tr, missing = NA)
+dtest  <- xgb.DMatrix(data = Xte_m, label = y_te, missing = NA)
+
+params <- list(
+  objective = "binary:logistic",
+  eval_metric = "auc",
+  max_depth = 5,
+  eta = 0.05,
+  subsample = 0.8,
+  colsample_bytree = 0.8,
+  min_child_weight = 5,
+  nthread = 0)
+
+watch <- list(train = dtrain, eval = dtest)
+xgb_fit <- xgb.train(
+  params = params,
+  data = dtrain,
+  nrounds = 2000,
+  watchlist = watch,
+  early_stopping_rounds = 50,
+  verbose = 0)
+
+#xgb_fit$best_iteration
+
+pred_prob <- predict(xgb_fit, dtest)
+roc_xgb <- roc(response = y_te, predictor = pred_prob, quiet = TRUE)
+auc_xgb <- auc(roc_xgb)
+#print(auc_xgb)
+
+plot_df <- data.frame(
+  prob = pred_prob,
+  churn = factor(test$si2014.x, levels = c(0,1), labels = c("Churn","Non-churn")))
+
+
+plot(roc_xgb, main = sprintf("ROC – XGBoost (AUC = %.3f)", as.numeric(auc_xgb)))
+```
+
+With this model we finally reach very good results. The AUC for the XGBoost model is 0.837, much better than the previous results.
+
+```{r}
+ggplot(plot_df, aes(x = prob, colour = churn, fill = churn)) +
+  geom_density(alpha = 0.35, adjust = 1.5, trim = TRUE) +
+  labs(title = "Predicted churn probabilities — density",
+       x = "Predicted probability of non churn", y = "Density") +
+  coord_cartesian(xlim = c(0, 1)) +
+  theme_minimal()
+```
+
+From the density distribution we can see that there is a clear separation between the two classes: non-churners are on the right side and churners are lower. There's a small overlap between 0.25 and 0.7.
+
+We can also try another model, this time a simple gradient boosting, with the same covariates as XGBoost.
+
+```{r}
+set.seed(123)
+
+df_clean_red <- df_clean[, c(
+  "si2014.x", "ultimo_ing.x", "data_inizio", "importo", "sconto",
+  "riduzione", "tipo_pag", "agenzia", "agenzia_tipo", "sesso", "data_nascita",
+  "comune", "cap", "nuovo_abb", "total_visits", "degree", "strength",
+  "betweenness", "closeness", "eigenvector", "pagerank")]
+
+idx <- createDataPartition(df_clean_red$si2014.x, p = 0.7, list = FALSE)
+train <- df_clean_red[idx, ]
+test  <- df_clean_red[-idx, ]
+
+train$si2014.x <- as.numeric(as.character(train$si2014.x))
+test$si2014.x  <- as.numeric(as.character(test$si2014.x))
+train$ultimo_ing.x <- as.numeric(as.Date(train$ultimo_ing.x))
+test$ultimo_ing.x  <- as.numeric(as.Date(test$ultimo_ing.x))
+train$data_inizio  <- as.numeric(as.Date(train$data_inizio))
+test$data_inizio   <- as.numeric(as.Date(test$data_inizio))
+
+# Characters -> factors, and sync levels between train/test
+char_cols <- names(train)[vapply(train, is.character, logical(1))]
+for (nm in char_cols) {
+  train[[nm]] <- factor(train[[nm]])
+  test[[nm]]  <- factor(test[[nm]], levels = levels(train[[nm]]))
+}
+
+gbm_fit <- gbm(
+  formula = si2014.x ~ .,
+  data = train,
+  distribution = "bernoulli",
+  n.trees = 4000,
+  interaction.depth = 3,
+  shrinkage = 0.03,
+  n.minobsinnode = 20,
+  bag.fraction = 0.8,
+  cv.folds = 5,
+  verbose = FALSE)
+
+#best_iter <- gbm.perf(gbm_fit, method = "cv")  # best number of trees
+
+pred_prob_gbm <- predict(gbm_fit, newdata = test, n.trees = best_iter, type = "response")
+
+#plot_df <- data.frame(prob = pred_prob_gbm, churn = factor(test$si2014.x, levels = c(0,1), labels = c("Churn","Non-churn")))
+
+roc_gbm <- roc(response = test$si2014.x, predictor = pred_prob_gbm, quiet = TRUE)
+auc_gbm <- auc(roc_gbm)
+#print(auc_gbm)
+plot(roc_gbm, main = sprintf("ROC — GBM (AUC = %.3f)", as.numeric(auc_gbm)))
+```
+
+The result is the same of the XGBoost model, this only performs slightly worse, where the AUC is 0.833 (versus the 0.837).
+
+```{r}
+ggplot(plot_df, aes(x = prob, colour = churn, fill = churn)) +
+  geom_density(alpha = 0.35, adjust = 1.1, trim = TRUE) +
+  labs(title = "Predicted churn probabilities — GBM",
+       x = "Predicted probability of non churn", y = "Density") +
+  coord_cartesian(xlim = c(0,1)) +
+  theme_minimal()
+```
+
+As expected, the probability distribution is almost the same of the one earlier, where non-churners are on the right side and there's a small overlap.
+
+### 8
+
+```{r}
+value_col <- "importo"
+val <- as.numeric(test[[value_col]])
+
+contact_cost <- 2
+voucher <- 10
+
+# Ensure we are working with P(churn) (so churners have higher mean)
+ensure_p_churn <- function(p, y01) {
+  m0 <- mean(p[y01 == 0], na.rm = TRUE) # mean for churners
+  m1 <- mean(p[y01 == 1], na.rm = TRUE) # mean for non-churners
+  if (is.na(m0) || is.na(m1)) stop("NA in probability vector or y_te.")
+  if (m0 >= m1) p else 1 - p
+}
+
+# Expected incremental profit if we contact a customer with p_churn and value v
+# Non-churners contacted:  -2
+# Churners contacted: v - (2 + 10)
+expected_profit_per_contact <- function(p_churn, v, cost = 2, voucher = 10) {
+  p_churn * (v - (cost + voucher)) + (1 - p_churn) * (-cost)
+  # algebraically: p_churn*(v - 10) - 2
+}
+
+# Build the cumulative-profit curve for one model
+profit_curve <- function(p_any, y01, v, model_name) {
+  p_churn <- ensure_p_churn(p_any, y01)
+  ord <- order(p_churn, decreasing = TRUE)     # contact highest churn first
+  ep  <- expected_profit_per_contact(p_churn[ord], v[ord])
+  tibble(
+    k = seq_along(ep),
+    frac = k / length(ep),
+    cum_profit = cumsum(ep),
+    model = model_name)
+}
+
+#set.seed(12345)
+#prediction_prob_rf_sample <- prediction_prob_rf[sample.int(length(prediction_prob_rf), 4000)]
+#logit_probs_sample <- logit_probs[sample.int(length(logit_probs), 4000)]
+#pred_prob_gbm_sample <- pred_prob_gbm[sample.int(length(pred_prob_gbm), 4000)]
+
+preds <- list()
+
+preds$GBM        <- pred_prob_gbm
+preds$Logit      <- logit_probs
+preds$RF         <- prediction_prob_rf
+
+
+preds <- Filter(Negate(is.null), preds)    # drop any NULL entries
+stopifnot(length(preds) > 0)
+
+svm_prob <- attr(svm_pred, "probabilities")[, "1"]   # P(class==1)
+preds$SVM <- as.numeric(svm_prob)
+
+curves <- imap_dfr(preds, ~ profit_curve(.x, test, val, .y))
+
+summary_tab <- curves %>%
+  group_by(model) %>%
+  slice_max(cum_profit, n = 1, with_ties = FALSE) %>%
+  transmute(
+    model,
+    best_k = k,
+    best_frac = round(frac, 3),
+    best_profit_eur = round(cum_profit, 2))
+
+#print(summary_tab)
+
+#ggplot(curves, aes(x = frac, y = cum_profit, colour = model)) +
+#  geom_line(size = 1) +
+#  labs(title = "Cumulative expected profit by model",
+#       x = "Fraction of customers contacted (sorted by P(churn))",
+#       y = "Cumulative expected profit (€)") +
+#  theme_minimal()
+```
+
+```{r}
+# (Optional) add points at each model's optimum
+best_pts <- curves %>% group_by(model) %>% slice_max(cum_profit, n = 1, with_ties = FALSE)
+ggplot(curves, aes(frac, cum_profit, colour = model)) +
+  geom_line(size = 1) +
+  geom_point(data = best_pts, size = 2) +
+  ggrepel::geom_text_repel(data = best_pts,
+                           aes(label = paste0(model, "\n", round(cum_profit,0), "€ @ ", round(frac*100,1), "%")),
+                           show.legend = FALSE) +
+  labs(title = "Profit curves (optimum marked)",
+       x = "Fraction contacted", y = "Cumulative expected profit (€)") +
+  theme_minimal()
+```
+
+
+```{r}
+diagnose_model <- function(p_any, y01, v, name){
+  cat("\n==", name, "==\n")
+  cat("lengths p/y/v:", length(p_any), length(y01), length(v), "\n")
+  cat("NA p:", sum(is.na(p_any)), " NA v:", sum(is.na(v)), " NA y:", sum(is.na(y01)), "\n")
+  cat("range p_any:", range(p_any, na.rm=TRUE), "\n")
+}
+
+purrr::iwalk(preds, ~diagnose_model(.x, y_te, val, .y))
+```
+
+
+```{r}
+table(y_te)
+
+# Check if your probs really point to churners
+p <- ensure_p_churn(preds$GBM, y_te)  # pick any model for the check
+m_churn     <- mean(p[y_te == 0], na.rm=TRUE)
+m_nonchurn  <- mean(p[y_te == 1], na.rm=TRUE)
+cat("mean P(churn) | churners:", m_churn, " | non-churners:", m_nonchurn, "\n")
+
+ep <- p * val - (contact_cost + voucher)   # since voucher to all
+summary(ep); mean(ep > 0)
+```
+
+```{r}
+preds <- list()
+#preds$SVM          <- svm_pred
+preds$XGBoost      <- pred_prob
+
+
+preds <- Filter(Negate(is.null), preds)    # drop any NULL entries
+stopifnot(length(preds) > 0)
+
+svm_prob <- attr(svm_pred, "probabilities")[, "1"]   # P(class==1)
+#preds$SVM <- as.numeric(svm_prob)
+
+curves <- imap_dfr(preds, ~ profit_curve(.x, y_te, val, .y))
+
+summary_tab <- curves %>%
+  group_by(model) %>%
+  slice_max(cum_profit, n = 1, with_ties = FALSE) %>%
+  transmute(
+    model,
+    best_k = k,
+    best_frac = round(frac, 3),
+    best_profit_eur = round(cum_profit, 2))
+
+#print(summary_tab)
+
+#ggplot(curves, aes(x = frac, y = cum_profit, colour = model)) +
+#  geom_line(size = 1) +
+#  labs(title = "Cumulative expected profit by model",
+#       x = "Fraction of customers contacted (sorted by P(churn))",
+#       y = "Cumulative expected profit (€)") +
+#  theme_minimal()
+```
+
+```{r}
+best_pts <- curves %>% group_by(model) %>% slice_max(cum_profit, n = 1, with_ties = FALSE)
+ggplot(curves, aes(frac, cum_profit, colour = model)) +
+  geom_line(size = 1) +
+  geom_point(data = best_pts, size = 2) +
+  ggrepel::geom_text_repel(data = best_pts,
+                           aes(label = paste0(model, "\n", round(cum_profit,0), "€ @ ", round(frac*100,1), "%")),
+                           show.legend = FALSE) +
+  labs(title = "Profit curves (optimum marked)",
+       x = "Fraction contacted", y = "Cumulative expected profit (€)") +
+  theme_minimal()
+```
+
